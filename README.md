@@ -19,3 +19,8 @@ First create a configuration file at `/etc/sts/config.yaml`, `$HOME/.sts/config.
         remote: "localhost:80" 
 
 Then run sts.
+
+# Download
+
+Go to the main [site](https://jeffwilliams.github.io/sts/)
+

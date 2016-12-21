@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/spf13/viper"
@@ -91,10 +91,15 @@ func buildSshConfig() *ssh.ClientConfig {
 	return sshconf
 }
 
+// Tunnel represents a Local TCP port forwarded to a remote TCP endpoint.
+// When the tunnel is started a local TCP socket is opened listening
+// on the Local TCP port.  When a connection is established to the local socket
+// a new ssh forwarding is established in the existing ssh Client connection and
+// the traffic for the local TCP connection is forwarded over it.
 type Tunnel struct {
 	Local  string
 	Remote string
-	Client *ssh.Client
+	Conn   *SshConn
 }
 
 func (t Tunnel) Start() error {
@@ -117,9 +122,27 @@ func (t Tunnel) Start() error {
 }
 
 func (t *Tunnel) forward(localConn net.Conn) {
-	remoteConn, err := t.Client.Dial("tcp", t.Remote)
+	client := t.Conn.Client()
+
+	var err error
+	var remoteConn net.Conn
+
+	for i := 0; i < 2; i++ {
+		remoteConn, err = client.Dial("tcp", t.Remote)
+		if err == nil {
+			break
+		}
+
+		fmt.Printf("Remote dial error: %s. Reconnecting...\n", err)
+		err = t.Conn.Dial()
+		if err != nil {
+			fmt.Printf("Reconnecting failed: %s.\n", err)
+			break
+		}
+	}
+
 	if err != nil {
-		fmt.Printf("Remote dial error: %s\n", err)
+		fmt.Printf("Exhausted retries\n")
 		return
 	}
 
@@ -140,7 +163,7 @@ func (t *Tunnel) forward(localConn net.Conn) {
 // openTunnel opens a tunnel over the ssh session.
 // local and remote should be TCP address strings, i.e.
 // ":8080" and "localhost:80"
-func openTunnel(client *ssh.Client, local, remote string) {
+func openTunnel(conn *SshConn, local, remote string) {
 	if len(local) == 0 || len(remote) == 0 {
 		log.Printf("Error: can't open tunnel %s -> %s: one side has an empty address", local, remote)
 		return
@@ -150,14 +173,14 @@ func openTunnel(client *ssh.Client, local, remote string) {
 	tunnel := Tunnel{
 		Local:  local,
 		Remote: remote,
-		Client: client,
+		Conn:   conn,
 	}
 
 	log.Printf("Opening tunnel %s -> %s", local, remote)
 	tunnel.Start()
 }
 
-func openConfiguredTunnels(client *ssh.Client) {
+func openConfiguredTunnels(conn *SshConn) {
 	tunnels, ok := viper.Get("tunnels").([]interface{})
 	if !ok {
 		log.Printf("Error: the tunnels config entry is not a slice")
@@ -175,21 +198,44 @@ func openConfiguredTunnels(client *ssh.Client) {
 		local := m["local"].(string)
 		remote := m["remote"].(string)
 
-		openTunnel(client, local, remote)
-		/*
-			log.Println("tunnel...")
-			switch m := t.(type) {
-			case map[string]interface{}:
-				log.Printf("arr")
-			case map[string]string:
-				local := m["local"]
-				remote := m["remote"]
-				openTunnel(client, local, remote)
-			default:
-				log.Printf("%t", m)
-			}
-		*/
+		go openTunnel(conn, local, remote)
 	}
+}
+
+// Wrapper around an ssh.Client that allows multiple Tunnels
+// to use the same client, and reconnect it if needed.
+type SshConn struct {
+	client atomic.Value
+	conf   *ssh.ClientConfig
+}
+
+func NewSshConn(conf *ssh.ClientConfig) *SshConn {
+	return &SshConn{conf: conf}
+}
+
+// Dial connects the ssh session. If the session is already open it is
+// closed and re-opened.
+func (sc *SshConn) Dial() error {
+	var c *ssh.Client
+
+	v := sc.client.Load()
+	if v != nil {
+		c = v.(*ssh.Client)
+		c.Close()
+	}
+
+	c, err := ssh.Dial("tcp", viper.GetString("dest"), sc.conf)
+	if err != nil {
+		return err
+	}
+
+	sc.client.Store(c)
+	return nil
+}
+
+func (sc *SshConn) Client() *ssh.Client {
+	c := sc.client.Load().(*ssh.Client)
+	return c
 }
 
 func main() {
@@ -201,27 +247,14 @@ func main() {
 
 	sshconf := buildSshConfig()
 
-	client, err := ssh.Dial("tcp", viper.GetString("dest"), sshconf)
+	conn := NewSshConn(sshconf)
+	err = conn.Dial()
 	if err != nil {
 		log.Fatalf("Unable to connect: %v", err)
 	}
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		panic("Failed to create session: " + err.Error())
-	}
-	defer session.Close()
-
-	var b bytes.Buffer
-	session.Stdout = &b
-	if err := session.Run("ls"); err != nil {
-		panic("Failed to run: " + err.Error())
-	}
-	fmt.Println(b.String())
 
 	// Open all the statically configured tunnels
-	openConfiguredTunnels(client)
+	openConfiguredTunnels(conn)
 
 	// Sleep forever
 	<-make(chan int)
